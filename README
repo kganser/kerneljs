@@ -1,0 +1,11 @@
+Kerneljs is a minimalist javascript interpreter with a nonblocking
+API in the style of the browser and nodejs. Read more about it at
+http://kganser.com/kerneljs.html
+
+Kerneljs is still in early development. To build it, you must
+first build the V8 library and have it in src/v8/libv8.a. It also
+requires the v8 header src/v8/include/v8.h and libev at src/libev.
+
+See also:
+http://code.google.com/apis/v8/build.html
+http://software.schmorp.de/pkg/libev.html
