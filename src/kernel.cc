@@ -2,6 +2,29 @@
 
 using namespace kernel;
 
+/* Main loop and eio watchers */
+struct ev_loop *loop;
+ev_idle repeat_watcher;
+ev_async ready_watcher;
+
+/* Callbacks for eio */
+void repeat(struct ev_loop *loop, ev_idle *w, int revents) {
+  if (eio_poll() != -1) ev_idle_stop(loop, w);
+}
+void ready(struct ev_loop *loop, ev_async *w, int revents) {
+  if (eio_poll() == -1) ev_idle_start(loop, &repeat_watcher);
+  else if (!eio_nreqs()) ev_async_stop(loop, &ready_watcher);
+}
+void want_poll() {
+  ev_async_send(loop, &ready_watcher);
+}
+
+int Error(TryCatch try_catch) {
+  Handle<Message> msg = try_catch.Message();
+  fprintf(stderr, "%s:%i: %s\n", *String::Utf8Value(msg->GetScriptResourceName()), msg->GetLineNumber(), *String::Utf8Value(msg->Get()));
+  return 1;
+}
+
 Persistent<ObjectTemplate> Timer::obj_template;
 
 Handle<Value> Timer::New(const Arguments& args) {
@@ -14,7 +37,7 @@ Handle<Value> Timer::Clear(const Arguments& args) {
   Timer *timer = static_cast<Timer *>(args.Holder()->GetPointerFromInternalField(0));
   if (ev_is_active(&timer->watcher)) {
     ev_timer_stop(loop, &timer->watcher);
-    timer->callback.Dispose(); // cannot delete timer because it is not orphaned
+    timer->callback.Dispose();
   }
   return Undefined();
 }
@@ -27,7 +50,6 @@ Timer::Timer(Handle<Function> cb, double time) {
   }
   object = Persistent<Object>::New(obj_template->NewInstance());
   callback = Persistent<Function>::New(cb);
-  orphan = false;
   
   object.MakeWeak(NULL, Dispose);
   object->SetPointerInInternalField(0, this);
@@ -44,12 +66,11 @@ void Timer::Timeout(EV_P_ ev_timer *watcher, int revents) {
   Handle<Value> result = timer->callback->Call(Context::GetCurrent()->Global(), 0, NULL);
   if (try_catch.HasCaught()) Error(try_catch);
   timer->callback.Dispose();
-  if (timer->orphan) delete timer;
+  if (timer->object.IsEmpty()) delete timer;
 }
 
 void Timer::Dispose(Persistent<Value> object, void *parameter) {
   Timer *timer = static_cast<Timer *>(Object::Cast(*object)->GetPointerFromInternalField(0));
-  timer->orphan = true;
   timer->object.Dispose();
   if (!ev_is_active(&timer->watcher)) delete timer;
 }
@@ -57,6 +78,18 @@ void Timer::Dispose(Persistent<Value> object, void *parameter) {
 Persistent<ObjectTemplate> Server::obj_template;
 Persistent<ObjectTemplate> Client::obj_template;
 Persistent<ObjectTemplate> Agent::Connection::obj_template;
+
+void Agent::Resolve(eio_req *req) {
+  Agent *agent = static_cast<Agent *>(req->data);
+  struct addrinfo hints;
+
+  memset(&hints, 0, sizeof hints);
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  if (!agent->host) hints.ai_flags = AI_PASSIVE;
+
+  req->result = getaddrinfo(agent->host, agent->port, &hints, &agent->address);
+}
 
 Agent::Connection::Connection(int fd, const struct sockaddr_storage& addr) {
   if (obj_template.IsEmpty()) {
@@ -69,18 +102,17 @@ Agent::Connection::Connection(int fd, const struct sockaddr_storage& addr) {
   object = Persistent<Object>::New(obj_template->NewInstance());
   
   struct sockaddr *sa = (struct sockaddr *) &addr;
-  inet_ntop(addr.ss_family, sa->sa_family == AF_INET ? (void *) &((struct sockaddr_in*)sa)->sin_addr : &((struct sockaddr_in6*)sa)->sin6_addr, address, sizeof(address));
+  inet_ntop(addr.ss_family, sa->sa_family == AF_INET ? (void *) &((struct sockaddr_in*)sa)->sin_addr : (void *) &((struct sockaddr_in6*)sa)->sin6_addr, address, sizeof(address));
   
   object.MakeWeak(NULL, Dispose);
   object->SetPointerInInternalField(0, this);
   reader.data = writer.data = this;
-  orphan = false;
   read_buffer = "";
   write_buffer = "";
   
   ev_io_init(&reader, Read, fd, EV_READ);
   ev_io_init(&writer, Write, fd, EV_WRITE);
-  ev_io_start(loop, &reader); // will this let client register reader callback in time?
+  ev_io_start(loop, &reader);
 }
 
 Handle<Value> Agent::Connection::GetReader(Local<String> property, const AccessorInfo &info) {
@@ -110,11 +142,12 @@ Handle<Value> Agent::Connection::Write(const Arguments &args) {
 Handle<Value> Agent::Connection::Close(const Arguments &args) {
   Connection *conn = static_cast<Connection *>(args.Holder()->GetPointerFromInternalField(0));
   if (ev_is_active(&conn->reader)) {
-    if (ev_is_active(&conn->writer)) // stop only when write buffer empty?
+    // TODO: Stop writer after write buffer is empty
+    if (ev_is_active(&conn->writer))
       ev_io_stop(loop, &conn->writer);
     ev_io_stop(loop, &conn->reader);
     close(conn->reader.fd);
-    if (conn->orphan) delete conn;
+    if (conn->object.IsEmpty()) delete conn;
   }
   return Undefined();
 }
@@ -122,16 +155,19 @@ Handle<Value> Agent::Connection::Close(const Arguments &args) {
 void Agent::Connection::Read(EV_P_ ev_io *watcher, int revents) {
   Connection *conn = static_cast<Connection *>(watcher->data);
   char buffer[1024];
-  int bytes, flag = conn->callback.IsEmpty() ? MSG_PEEK : 0;
+  int bytes, peek = conn->callback.IsEmpty() ? MSG_PEEK : 0;
   
-  while ((bytes = recv(watcher->fd, buffer, sizeof buffer, flag)) > 0 && !flag)
+  while ((bytes = recv(watcher->fd, buffer, sizeof buffer, peek)) > 0 && !peek)
     conn->read_buffer.append(buffer, bytes);
   
   if (!bytes) {
+    // Connection closed by peer
     ev_io_stop(loop, watcher);
     close(watcher->fd);
-    if (conn->orphan) delete conn;
-  } else if (!flag && conn->read_buffer.length()) {
+    if (conn->object.IsEmpty()) delete conn;
+  } else if (!peek && conn->read_buffer.length()) {
+    // Call back to javascript
+    // TODO: Make UTF-8 safe
     Handle<Value> arg[] = { String::New(conn->read_buffer.c_str()) };
     conn->callback->Call(conn->object, 1, arg);
     conn->read_buffer = "";
@@ -158,55 +194,58 @@ void Agent::Connection::Write(EV_P_ ev_io *watcher, int revents) {
 
 void Agent::Connection::Dispose(Persistent<Value> object, void *parameter) {
   Connection *conn = static_cast<Connection *>(Object::Cast(*object)->GetPointerFromInternalField(0));
-  conn->orphan = true;
   conn->object.Dispose();
   conn->callback.Dispose(); // check isEmpty?
   if (!ev_is_active(&conn->reader)) delete conn;
 }
 
-Handle<Value> Server::New(const Arguments &args) { // callback, port=80, ip address=localhost
+Handle<Value> Server::New(const Arguments &args) {
   if (args.Length() < 2 || !args[0]->IsFunction()) return Undefined();
   return (new Server(Handle<Function>::Cast(args[0]), *String::Utf8Value(args[1])))->object;
 }
 
 Server::Server(Handle<Function> cb, const char *port) {
-  int yes = 1, sock, client;
-  struct addrinfo hints, *address, *a;
-
-  memset(&hints, 0, sizeof hints);
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;
-
-  if (getaddrinfo(NULL, port, &hints, &address))
-    throw "getaddrinfo";
-
-  for (a = address; a; a = a->ai_next) {
-    if ((sock = socket(a->ai_family, a->ai_socktype, a->ai_protocol)) == -1) continue;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
-    fcntl(sock, F_SETFL, O_NONBLOCK);
-    if (bind(sock, a->ai_addr, a->ai_addrlen) == -1) { close(sock); continue; }
-    break;
-  }
-
-  freeaddrinfo(address);
-  if (!a) throw "bind";
-  if (listen(sock, -1) == -1) throw "listen";
+  this->host = NULL;
+  this->port = port;
   
   if (obj_template.IsEmpty()) {
     obj_template = Persistent<ObjectTemplate>::New(ObjectTemplate::New());
     obj_template->SetInternalFieldCount(1);
     obj_template->Set(String::New("close"), FunctionTemplate::New(Close));
   }
-  object = Persistent<Object>::New(obj_template->NewInstance());
-  callback = Persistent<Function>::New(cb);
   
+  object = Persistent<Object>::New(obj_template->NewInstance());
   object.MakeWeak(NULL, Dispose);
   object->SetPointerInInternalField(0, this);
-  watcher.data = this;
+  callback = Persistent<Function>::New(cb);
   
-  ev_io_init(&watcher, Listen, sock, EV_READ);
-  ev_io_start(loop, &watcher);
+  if (!ev_is_active(&ready_watcher)) ev_async_start(loop, &ready_watcher);
+  eio_custom(Resolve, 0, OnResolve, this);
+}
+
+int Server::OnResolve(eio_req *req) {
+  if (req->result) fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(req->result));
+  Server *server = static_cast<Server *>(req->data);
+  struct addrinfo *a;
+  int yes = 1, sock;
+  
+  for (a = server->address; a; a = a->ai_next) {
+    if ((sock = socket(a->ai_family, a->ai_socktype, a->ai_protocol)) == -1) continue;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+    if (bind(sock, a->ai_addr, a->ai_addrlen) == -1) { close(sock); continue; }
+    break;
+  }
+  
+  freeaddrinfo(server->address);
+  if (!a) perror("bind");
+  if (listen(sock, -1) == -1) perror("listen");
+  
+  server->watcher.data = server;
+  ev_io_init(&server->watcher, Listen, sock, EV_READ);
+  ev_io_start(loop, &server->watcher);
+  
+  return 0;
 }
 
 void Server::Listen(EV_P_ ev_io *watcher, int revents) {
@@ -219,8 +258,7 @@ void Server::Listen(EV_P_ ev_io *watcher, int revents) {
   if ((sock = accept(watcher->fd, (struct sockaddr *)&address, &sock_size)) >= 0) {
     fcntl(sock, F_SETFL, O_NONBLOCK);
     TryCatch try_catch;
-    Handle<Value> arg[] = { (new Connection(sock, address))->object };
-    Handle<Value> result = server->callback->Call(Context::GetCurrent()->Global(), 1, arg);
+    Handle<Value> result = server->callback->Call((new Connection(sock, address))->object, 0, NULL);
     if (try_catch.HasCaught()) Error(try_catch);
   }
 }
@@ -243,53 +281,68 @@ void Server::Dispose(Persistent<Value> object, void *parameter) {
 
 Handle<Value> Client::New(const Arguments &args) {
   if (args.Length() < 2 || !args[0]->IsFunction()) return Undefined();
-  const char *host = args.Length() > 2 ? *String::Utf8Value(args[2]) : "localhost";
-  return (new Client(Handle<Function>::Cast(args[0]), *String::Utf8Value(args[1]), host))->object;
+  const char *host = args.Length() > 2 ? strdup(*String::Utf8Value(args[2])) : "localhost";
+  const char *port = strdup(*String::Utf8Value(args[1]));
+  return (new Client(Handle<Function>::Cast(args[0]), port, host))->object;
 }
 
 Client::Client(Handle<Function> cb, const char *port, const char *host) {
-  int sock;
-  struct addrinfo hints, *address, *a;
-
-  memset(&hints, 0, sizeof hints);
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-
-  if (getaddrinfo(NULL, port, &hints, &address))
-    throw "getaddrinfo";
-
-  for (a = address; a; a = a->ai_next) {
-    if ((sock = socket(a->ai_family, a->ai_socktype, a->ai_protocol)) == -1) continue;
-    fcntl(sock, F_SETFL, O_NONBLOCK);
-    if (connect(sock, a->ai_addr, a->ai_addrlen) == -1) { close(sock); continue; }
-    break;
-  }
-  
-  if (!a) throw "failed to connect";
+  this->host = host;
+  this->port = port;
   
   if (obj_template.IsEmpty()) {
     obj_template = Persistent<ObjectTemplate>::New(ObjectTemplate::New());
     obj_template->SetInternalFieldCount(1);
   }
-  object = Persistent<Object>::New(obj_template->NewInstance());
-  callback = Persistent<Function>::New(cb);
   
+  object = Persistent<Object>::New(obj_template->NewInstance());
   object.MakeWeak(NULL, Dispose);
   object->SetPointerInInternalField(0, this);
+  callback = Persistent<Function>::New(cb);
   
-  TryCatch try_catch;
-  Handle<Value> arg[] = { (new Connection(sock, *(struct sockaddr_storage*)a->ai_addr))->object };
-  Handle<Value> result = callback->Call(Context::GetCurrent()->Global(), 1, arg);
-  if (try_catch.HasCaught()) Error(try_catch);
+  if (!ev_is_active(&ready_watcher)) ev_async_start(loop, &ready_watcher);
+  eio_custom(Resolve, 0, OnResolve, this);
+}
+
+int Client::OnResolve(eio_req *req) {
+  if (req->result) fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(req->result));
+  Client *client = static_cast<Client *>(req->data);
+  struct addrinfo *a;
+  int sock;
   
-  freeaddrinfo(address);
+  for (a = client->address; a; a = a->ai_next) {
+    if ((sock = socket(a->ai_family, a->ai_socktype, a->ai_protocol)) == -1) continue;
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+    if (connect(sock, a->ai_addr, a->ai_addrlen) == -1 && errno != EINPROGRESS) { close(sock); continue; }
+    break;
+  }
+  
+  if (!(client->address = a)) perror("connect");
+  
+  client->watcher.data = client;
+  ev_io_init(&client->watcher, Connect, sock, EV_WRITE);
+  ev_io_start(loop, &client->watcher);
+  
+  return 0;
+}
+
+void Client::Connect(EV_P_ ev_io *watcher, int revents) {
+  Client *client = static_cast<Client *>(watcher->data);
+  
+  if (!connect(watcher->fd, client->address->ai_addr, client->address->ai_addrlen) || errno == EISCONN) {
+    TryCatch try_catch;
+    Handle<Value> result = client->callback->Call((new Connection(watcher->fd, *(struct sockaddr_storage*)client->address->ai_addr))->object, 0, NULL);
+    if (try_catch.HasCaught()) Error(try_catch);
+  }
+  
+  freeaddrinfo(client->address);
+  ev_io_stop(loop, watcher);
 }
 
 void Client::Dispose(Persistent<Value> object, void *parameter) {
   Client *client = static_cast<Client *>(Object::Cast(*object)->GetPointerFromInternalField(0));
   client->object.Dispose();
-  //TODO
-  //if (!ev_is_active(&client->watcher)) delete client;
+  if (!ev_is_active(&client->watcher)) delete client;
 }
 
 Handle<Value> Purge(const Arguments& args) {
@@ -298,12 +351,11 @@ Handle<Value> Purge(const Arguments& args) {
 }
 
 Handle<Value> Print(const Arguments& args) {
-  String::Utf8Value str(args[0]->ToString());
-  fputs(*str, stdout);
+  puts(*String::Utf8Value(args[0]));
   return Undefined();
 }
 
-Handle<String> Read(istream &input) {
+Handle<String> ReadScript(istream &input) {
   string line, output = "";
   while (getline(input, line))
     output += line+'\n';
@@ -322,15 +374,22 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
       return 1;
     }
-    code = Read(file);
+    code = ReadScript(file);
     file.close();
   } else {
     source = "stdin";
-    code = Read(cin);
+    code = ReadScript(cin);
   }
   
   if (!code.IsEmpty()) {
   
+    loop = EV_DEFAULT;
+    
+    /* Initialize eio */
+    ev_idle_init(&repeat_watcher, repeat);
+    ev_async_init(&ready_watcher, ready);
+    eio_init(want_poll, 0);
+    
     Handle<ObjectTemplate> global = ObjectTemplate::New();
     global->Set(String::New("setTimeout"), FunctionTemplate::New(Timer::New));
     global->Set(String::New("listen"), FunctionTemplate::New(Server::New));
@@ -352,4 +411,3 @@ int main(int argc, char* argv[]) {
   
   return 0;
 }
-
