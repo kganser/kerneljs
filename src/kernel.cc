@@ -19,7 +19,7 @@ void want_poll() {
   ev_async_send(loop, &ready_watcher);
 }
 
-int Error(TryCatch try_catch) {
+int Error(const TryCatch& try_catch) {
   Handle<Message> msg = try_catch.Message();
   fprintf(stderr, "%s:%i: %s\n", *String::Utf8Value(msg->GetScriptResourceName()), msg->GetLineNumber(), *String::Utf8Value(msg->Get()));
   return 1;
@@ -60,7 +60,7 @@ Timer::Timer(Handle<Function> cb, double time) {
   ev_timer_start(loop, &watcher);
 }
 
-void Timer::Timeout(EV_P_ ev_timer *watcher, int revents) {
+void Timer::Timeout(struct ev_loop *loop, ev_timer *watcher, int revents) {
   Timer *timer = static_cast<Timer *>(watcher->data);
   TryCatch try_catch;
   Handle<Value> result = timer->callback->Call(Context::GetCurrent()->Global(), 0, NULL);
@@ -86,9 +86,19 @@ void Agent::Resolve(eio_req *req) {
   memset(&hints, 0, sizeof hints);
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
-  if (!agent->host) hints.ai_flags = AI_PASSIVE;
+  if (agent->host.empty()) hints.ai_flags = AI_PASSIVE;
 
-  req->result = getaddrinfo(agent->host, agent->port, &hints, &agent->address);
+  req->result = getaddrinfo(agent->host.empty() ? NULL : agent->host.c_str(), agent->port.c_str(), &hints, &agent->address);
+}
+
+Handle<Value> Agent::Close(const Arguments &args) {
+  Agent *agent = static_cast<Agent *>(args.Holder()->GetPointerFromInternalField(0));
+  if (ev_is_active(&agent->watcher)) {
+    ev_io_stop(loop, &agent->watcher);
+    close(agent->watcher.fd);
+    agent->callback.Dispose();
+  }
+  return Undefined();
 }
 
 Agent::Connection::Connection(int fd, const struct sockaddr_storage& addr) {
@@ -152,7 +162,7 @@ Handle<Value> Agent::Connection::Close(const Arguments &args) {
   return Undefined();
 }
 
-void Agent::Connection::Read(EV_P_ ev_io *watcher, int revents) {
+void Agent::Connection::Read(struct ev_loop *loop, ev_io *watcher, int revents) {
   Connection *conn = static_cast<Connection *>(watcher->data);
   char buffer[1024];
   int bytes, peek = conn->callback.IsEmpty() ? MSG_PEEK : 0;
@@ -174,7 +184,7 @@ void Agent::Connection::Read(EV_P_ ev_io *watcher, int revents) {
   }
 }
 
-void Agent::Connection::Write(EV_P_ ev_io *watcher, int revents) {
+void Agent::Connection::Write(struct ev_loop *loop, ev_io *watcher, int revents) {
   Connection *conn = static_cast<Connection *>(watcher->data);
   const char *buffer = conn->write_buffer.c_str();
   int n, sent = 0, left = conn->write_buffer.length();
@@ -201,11 +211,11 @@ void Agent::Connection::Dispose(Persistent<Value> object, void *parameter) {
 
 Handle<Value> Server::New(const Arguments &args) {
   if (args.Length() < 2 || !args[0]->IsFunction()) return Undefined();
-  return (new Server(Handle<Function>::Cast(args[0]), *String::Utf8Value(args[1])))->object;
+  const char *port = strdup(*String::Utf8Value(args[1]));
+  return (new Server(Handle<Function>::Cast(args[0]), port))->object;
 }
 
 Server::Server(Handle<Function> cb, const char *port) {
-  this->host = NULL;
   this->port = port;
   
   if (obj_template.IsEmpty()) {
@@ -248,7 +258,7 @@ int Server::OnResolve(eio_req *req) {
   return 0;
 }
 
-void Server::Listen(EV_P_ ev_io *watcher, int revents) {
+void Server::Listen(struct ev_loop *loop, ev_io *watcher, int revents) {
   Server *server = static_cast<Server *>(watcher->data);
   
   int sock;
@@ -263,16 +273,6 @@ void Server::Listen(EV_P_ ev_io *watcher, int revents) {
   }
 }
 
-Handle<Value> Server::Close(const Arguments &args) {
-  Server *server = static_cast<Server *>(args.Holder()->GetPointerFromInternalField(0));
-  if (ev_is_active(&server->watcher)) {
-    ev_io_stop(loop, &server->watcher);
-    close(server->watcher.fd);
-    server->callback.Dispose();
-  }
-  return Undefined();
-}
-
 void Server::Dispose(Persistent<Value> object, void *parameter) {
   Server *server = static_cast<Server *>(Object::Cast(*object)->GetPointerFromInternalField(0));
   server->object.Dispose();
@@ -281,7 +281,7 @@ void Server::Dispose(Persistent<Value> object, void *parameter) {
 
 Handle<Value> Client::New(const Arguments &args) {
   if (args.Length() < 2 || !args[0]->IsFunction()) return Undefined();
-  const char *host = args.Length() > 2 ? strdup(*String::Utf8Value(args[2])) : "localhost";
+  const char *host = args.Length() > 2 ? strdup(*String::Utf8Value(args[2])) : "127.0.0.1";
   const char *port = strdup(*String::Utf8Value(args[1]));
   return (new Client(Handle<Function>::Cast(args[0]), port, host))->object;
 }
@@ -293,6 +293,7 @@ Client::Client(Handle<Function> cb, const char *port, const char *host) {
   if (obj_template.IsEmpty()) {
     obj_template = Persistent<ObjectTemplate>::New(ObjectTemplate::New());
     obj_template->SetInternalFieldCount(1);
+    obj_template->Set(String::New("close"), FunctionTemplate::New(Close));
   }
   
   object = Persistent<Object>::New(obj_template->NewInstance());
@@ -326,7 +327,7 @@ int Client::OnResolve(eio_req *req) {
   return 0;
 }
 
-void Client::Connect(EV_P_ ev_io *watcher, int revents) {
+void Client::Connect(struct ev_loop *loop, ev_io *watcher, int revents) {
   Client *client = static_cast<Client *>(watcher->data);
   
   if (!connect(watcher->fd, client->address->ai_addr, client->address->ai_addrlen) || errno == EISCONN) {
@@ -351,7 +352,7 @@ Handle<Value> Purge(const Arguments& args) {
 }
 
 Handle<Value> Print(const Arguments& args) {
-  puts(*String::Utf8Value(args[0]));
+  fputs(*String::Utf8Value(args[0]), stdout);
   return Undefined();
 }
 
