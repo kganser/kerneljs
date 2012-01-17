@@ -27,7 +27,7 @@ int Error(const TryCatch& try_catch) {
 
 Persistent<ObjectTemplate> Timer::obj_template;
 
-Handle<Value> Timer::New(const Arguments& args) {
+Handle<Value> Timer::New(const Arguments &args) {
   if (!args.Length() || !args[0]->IsFunction()) return Undefined();
   double delay = (args.Length() == 1 || !args[1]->IsNumber()) ? 0. : args[1]->NumberValue()/1000.;
   return (new Timer(Handle<Function>::Cast(args[0]), delay))->object;
@@ -211,12 +211,12 @@ void Agent::Connection::Dispose(Persistent<Value> object, void *parameter) {
 
 Handle<Value> Server::New(const Arguments &args) {
   if (args.Length() < 2 || !args[0]->IsFunction()) return Undefined();
-  const char *port = strdup(*String::Utf8Value(args[1]));
-  return (new Server(Handle<Function>::Cast(args[0]), port))->object;
+  return (new Server(Handle<Function>::Cast(args[0]), args[1]))->object;
 }
 
-Server::Server(Handle<Function> cb, const char *port) {
-  this->port = port;
+Server::Server(const Handle<Function> &cb, const Handle<Value> &port) {
+  this->port = *String::Utf8Value(port);
+  callback = Persistent<Function>::New(cb);
   
   if (obj_template.IsEmpty()) {
     obj_template = Persistent<ObjectTemplate>::New(ObjectTemplate::New());
@@ -227,7 +227,6 @@ Server::Server(Handle<Function> cb, const char *port) {
   object = Persistent<Object>::New(obj_template->NewInstance());
   object.MakeWeak(NULL, Dispose);
   object->SetPointerInInternalField(0, this);
-  callback = Persistent<Function>::New(cb);
   
   if (!ev_is_active(&ready_watcher)) ev_async_start(loop, &ready_watcher);
   eio_custom(Resolve, 0, OnResolve, this);
@@ -281,14 +280,13 @@ void Server::Dispose(Persistent<Value> object, void *parameter) {
 
 Handle<Value> Client::New(const Arguments &args) {
   if (args.Length() < 2 || !args[0]->IsFunction()) return Undefined();
-  const char *host = args.Length() > 2 ? strdup(*String::Utf8Value(args[2])) : "127.0.0.1";
-  const char *port = strdup(*String::Utf8Value(args[1]));
-  return (new Client(Handle<Function>::Cast(args[0]), port, host))->object;
+  return (new Client(Handle<Function>::Cast(args[0]), args[1], args.Length() > 2 ? args[2] : static_cast<Handle<Value> >(String::New("127.0.0.1"))))->object;
 }
 
-Client::Client(Handle<Function> cb, const char *port, const char *host) {
-  this->host = host;
-  this->port = port;
+Client::Client(const Handle<Function> &cb, const Handle<Value> &port, const Handle<Value> &host) {
+  this->host = *String::Utf8Value(host);
+  this->port = *String::Utf8Value(port);
+  callback = Persistent<Function>::New(cb);
   
   if (obj_template.IsEmpty()) {
     obj_template = Persistent<ObjectTemplate>::New(ObjectTemplate::New());
@@ -299,7 +297,6 @@ Client::Client(Handle<Function> cb, const char *port, const char *host) {
   object = Persistent<Object>::New(obj_template->NewInstance());
   object.MakeWeak(NULL, Dispose);
   object->SetPointerInInternalField(0, this);
-  callback = Persistent<Function>::New(cb);
   
   if (!ev_is_active(&ready_watcher)) ev_async_start(loop, &ready_watcher);
   eio_custom(Resolve, 0, OnResolve, this);

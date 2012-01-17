@@ -74,7 +74,7 @@ class Agent {
 };
 
 class Server: public Agent {
-  Server(Handle<Function> cb, const char *port);
+  Server(const Handle<Function> &cb, const Handle<Value> &port);
   static int OnResolve(eio_req *req);
   static void Listen(struct ev_loop *loop, ev_io *watcher, int revents);
   static void Dispose(Persistent<Value> object, void *parameter);
@@ -86,7 +86,7 @@ class Server: public Agent {
 };
 
 class Client: public Agent {
-  Client(Handle<Function> cb, const char *port, const char *host);
+  Client(const Handle<Function> &cb, const Handle<Value> &port, const Handle<Value> &host);
   static int OnResolve(eio_req *req);
   static void Connect(struct ev_loop *loop, ev_io *watcher, int revents);
   static void Dispose(Persistent<Value> object, void *parameter);
