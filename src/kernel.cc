@@ -63,7 +63,7 @@ Timer::Timer(Handle<Function> cb, double time) {
 void Timer::Timeout(struct ev_loop *loop, ev_timer *watcher, int revents) {
   Timer *timer = static_cast<Timer *>(watcher->data);
   TryCatch try_catch;
-  Handle<Value> result = timer->callback->Call(Context::GetCurrent()->Global(), 0, NULL);
+  timer->callback->Call(Context::GetCurrent()->Global(), 0, NULL);
   if (try_catch.HasCaught()) Error(try_catch);
   timer->callback.Dispose();
   if (timer->object.IsEmpty()) delete timer;
@@ -178,8 +178,8 @@ void Agent::Connection::Read(struct ev_loop *loop, ev_io *watcher, int revents) 
   } else if (!peek && conn->read_buffer.length()) {
     // Call back to javascript
     // TODO: Make UTF-8 safe
-    Handle<Value> arg[] = { String::New(conn->read_buffer.c_str()) };
-    conn->callback->Call(conn->object, 1, arg);
+    Handle<Value> argv[] = {String::New(conn->read_buffer.c_str())};
+    conn->callback->Call(conn->object, 1, argv);
     conn->read_buffer = "";
   }
 }
@@ -267,7 +267,8 @@ void Server::Listen(struct ev_loop *loop, ev_io *watcher, int revents) {
   if ((sock = accept(watcher->fd, (struct sockaddr *)&address, &sock_size)) >= 0) {
     fcntl(sock, F_SETFL, O_NONBLOCK);
     TryCatch try_catch;
-    Handle<Value> result = server->callback->Call((new Connection(sock, address))->object, 0, NULL);
+    Handle<Value> argv[] = {(new Connection(sock, address))->object};
+    server->callback->Call(Context::GetCurrent()->Global(), 1, argv);
     if (try_catch.HasCaught()) Error(try_catch);
   }
 }
@@ -280,7 +281,9 @@ void Server::Dispose(Persistent<Value> object, void *parameter) {
 
 Handle<Value> Client::New(const Arguments &args) {
   if (args.Length() < 2 || !args[0]->IsFunction()) return Undefined();
-  return (new Client(Handle<Function>::Cast(args[0]), args[1], args.Length() > 2 ? args[2] : static_cast<Handle<Value> >(String::New("127.0.0.1"))))->object;
+  Handle<Value> host;
+  if (args.Length() > 2) host = args[2]; else host = String::New("127.0.0.1");
+  return (new Client(Handle<Function>::Cast(args[0]), args[1], host))->object;
 }
 
 Client::Client(const Handle<Function> &cb, const Handle<Value> &port, const Handle<Value> &host) {
@@ -329,7 +332,8 @@ void Client::Connect(struct ev_loop *loop, ev_io *watcher, int revents) {
   
   if (!connect(watcher->fd, client->address->ai_addr, client->address->ai_addrlen) || errno == EISCONN) {
     TryCatch try_catch;
-    Handle<Value> result = client->callback->Call((new Connection(watcher->fd, *(struct sockaddr_storage*)client->address->ai_addr))->object, 0, NULL);
+    Handle<Value> argv[] = {(new Connection(watcher->fd, *(struct sockaddr_storage*)client->address->ai_addr))->object};
+    client->callback->Call(Context::GetCurrent()->Global(), 1, argv);
     if (try_catch.HasCaught()) Error(try_catch);
   }
   
