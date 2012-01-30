@@ -2,30 +2,14 @@
 
 using namespace kernel;
 
-/* Main loop and eio watchers */
-struct ev_loop *loop;
-ev_idle repeat_watcher;
-ev_async ready_watcher;
-
-/* Callbacks for eio */
-void repeat(struct ev_loop *loop, ev_idle *w, int revents) {
-  if (eio_poll() != -1) ev_idle_stop(loop, w);
-}
-void ready(struct ev_loop *loop, ev_async *w, int revents) {
-  if (eio_poll() == -1) ev_idle_start(loop, &repeat_watcher);
-  else if (!eio_nreqs()) ev_async_stop(loop, &ready_watcher);
-}
-void want_poll() {
-  ev_async_send(loop, &ready_watcher);
-}
-
-int Error(const TryCatch& try_catch) {
-  Handle<Message> msg = try_catch.Message();
-  fprintf(stderr, "%s:%i: %s\n", *String::Utf8Value(msg->GetScriptResourceName()), msg->GetLineNumber(), *String::Utf8Value(msg->Get()));
-  return 1;
-}
-
 Persistent<ObjectTemplate> Timer::obj_template;
+Persistent<ObjectTemplate> Server::obj_template;
+Persistent<ObjectTemplate> Client::obj_template;
+Persistent<ObjectTemplate> Agent::Connection::obj_template;
+
+struct ev_loop *Kernel::loop = EV_DEFAULT;
+ev_idle Kernel::idle_watcher;
+ev_async Kernel::async_watcher;
 
 Handle<Value> Timer::New(const Arguments &args) {
   if (!args.Length() || !args[0]->IsFunction()) return Undefined();
@@ -33,10 +17,10 @@ Handle<Value> Timer::New(const Arguments &args) {
   return (new Timer(Handle<Function>::Cast(args[0]), delay))->object;
 }
 
-Handle<Value> Timer::Clear(const Arguments& args) {
+Handle<Value> Timer::Clear(const Arguments &args) {
   Timer *timer = static_cast<Timer *>(args.Holder()->GetPointerFromInternalField(0));
   if (ev_is_active(&timer->watcher)) {
-    ev_timer_stop(loop, &timer->watcher);
+    ev_timer_stop(Kernel::loop, &timer->watcher);
     timer->callback.Dispose();
   }
   return Undefined();
@@ -57,14 +41,14 @@ Timer::Timer(Handle<Function> cb, double time) {
   
   ev_timer_init(&watcher, Timeout, time, 0.);
   ev_now_update(EV_DEFAULT_UC);
-  ev_timer_start(loop, &watcher);
+  ev_timer_start(Kernel::loop, &watcher);
 }
 
 void Timer::Timeout(struct ev_loop *loop, ev_timer *watcher, int revents) {
   Timer *timer = static_cast<Timer *>(watcher->data);
   TryCatch try_catch;
   timer->callback->Call(Context::GetCurrent()->Global(), 0, NULL);
-  if (try_catch.HasCaught()) Error(try_catch);
+  if (try_catch.HasCaught()) Kernel::Error(try_catch);
   timer->callback.Dispose();
   if (timer->object.IsEmpty()) delete timer;
 }
@@ -74,10 +58,6 @@ void Timer::Dispose(Persistent<Value> object, void *parameter) {
   timer->object.Dispose();
   if (!ev_is_active(&timer->watcher)) delete timer;
 }
-
-Persistent<ObjectTemplate> Server::obj_template;
-Persistent<ObjectTemplate> Client::obj_template;
-Persistent<ObjectTemplate> Agent::Connection::obj_template;
 
 void Agent::Resolve(eio_req *req) {
   Agent *agent = static_cast<Agent *>(req->data);
@@ -94,14 +74,14 @@ void Agent::Resolve(eio_req *req) {
 Handle<Value> Agent::Close(const Arguments &args) {
   Agent *agent = static_cast<Agent *>(args.Holder()->GetPointerFromInternalField(0));
   if (ev_is_active(&agent->watcher)) {
-    ev_io_stop(loop, &agent->watcher);
+    ev_io_stop(Kernel::loop, &agent->watcher);
     close(agent->watcher.fd);
     agent->callback.Dispose();
   }
   return Undefined();
 }
 
-Agent::Connection::Connection(int fd, const struct sockaddr_storage& addr) {
+Agent::Connection::Connection(int fd, const struct sockaddr_storage &addr) {
   if (obj_template.IsEmpty()) {
     obj_template = Persistent<ObjectTemplate>::New(ObjectTemplate::New());
     obj_template->SetInternalFieldCount(1);
@@ -122,7 +102,7 @@ Agent::Connection::Connection(int fd, const struct sockaddr_storage& addr) {
   
   ev_io_init(&reader, Read, fd, EV_READ);
   ev_io_init(&writer, Write, fd, EV_WRITE);
-  ev_io_start(loop, &reader);
+  ev_io_start(Kernel::loop, &reader);
 }
 
 Handle<Value> Agent::Connection::GetReader(Local<String> property, const AccessorInfo &info) {
@@ -144,7 +124,7 @@ Handle<Value> Agent::Connection::Write(const Arguments &args) {
   if (args.Length()) {
     conn->write_buffer += *String::Utf8Value(args[0]);
     if (!ev_is_active(&conn->writer))
-      ev_io_start(loop, &conn->writer);
+      ev_io_start(Kernel::loop, &conn->writer);
   }
   return conn->object;
 }
@@ -154,8 +134,8 @@ Handle<Value> Agent::Connection::Close(const Arguments &args) {
   if (ev_is_active(&conn->reader)) {
     // TODO: Stop writer after write buffer is empty
     if (ev_is_active(&conn->writer))
-      ev_io_stop(loop, &conn->writer);
-    ev_io_stop(loop, &conn->reader);
+      ev_io_stop(Kernel::loop, &conn->writer);
+    ev_io_stop(Kernel::loop, &conn->reader);
     close(conn->reader.fd);
     if (conn->object.IsEmpty()) delete conn;
   }
@@ -205,7 +185,7 @@ void Agent::Connection::Write(struct ev_loop *loop, ev_io *watcher, int revents)
 void Agent::Connection::Dispose(Persistent<Value> object, void *parameter) {
   Connection *conn = static_cast<Connection *>(Object::Cast(*object)->GetPointerFromInternalField(0));
   conn->object.Dispose();
-  conn->callback.Dispose(); // check isEmpty?
+  conn->callback.Dispose();
   if (!ev_is_active(&conn->reader)) delete conn;
 }
 
@@ -228,8 +208,7 @@ Server::Server(const Handle<Function> &cb, const Handle<Value> &port) {
   object.MakeWeak(NULL, Dispose);
   object->SetPointerInInternalField(0, this);
   
-  if (!ev_is_active(&ready_watcher)) ev_async_start(loop, &ready_watcher);
-  eio_custom(Resolve, 0, OnResolve, this);
+  Kernel::RunAsync(Resolve, 0, OnResolve, this);
 }
 
 int Server::OnResolve(eio_req *req) {
@@ -252,7 +231,7 @@ int Server::OnResolve(eio_req *req) {
   
   server->watcher.data = server;
   ev_io_init(&server->watcher, Listen, sock, EV_READ);
-  ev_io_start(loop, &server->watcher);
+  ev_io_start(Kernel::loop, &server->watcher);
   
   return 0;
 }
@@ -269,7 +248,7 @@ void Server::Listen(struct ev_loop *loop, ev_io *watcher, int revents) {
     TryCatch try_catch;
     Handle<Value> argv[] = {(new Connection(sock, address))->object};
     server->callback->Call(Context::GetCurrent()->Global(), 1, argv);
-    if (try_catch.HasCaught()) Error(try_catch);
+    if (try_catch.HasCaught()) Kernel::Error(try_catch);
   }
 }
 
@@ -301,8 +280,7 @@ Client::Client(const Handle<Function> &cb, const Handle<Value> &port, const Hand
   object.MakeWeak(NULL, Dispose);
   object->SetPointerInInternalField(0, this);
   
-  if (!ev_is_active(&ready_watcher)) ev_async_start(loop, &ready_watcher);
-  eio_custom(Resolve, 0, OnResolve, this);
+  Kernel::RunAsync(Resolve, 0, OnResolve, this);
 }
 
 int Client::OnResolve(eio_req *req) {
@@ -322,7 +300,7 @@ int Client::OnResolve(eio_req *req) {
   
   client->watcher.data = client;
   ev_io_init(&client->watcher, Connect, sock, EV_WRITE);
-  ev_io_start(loop, &client->watcher);
+  ev_io_start(Kernel::loop, &client->watcher);
   
   return 0;
 }
@@ -334,7 +312,7 @@ void Client::Connect(struct ev_loop *loop, ev_io *watcher, int revents) {
     TryCatch try_catch;
     Handle<Value> argv[] = {(new Connection(watcher->fd, *(struct sockaddr_storage*)client->address->ai_addr))->object};
     client->callback->Call(Context::GetCurrent()->Global(), 1, argv);
-    if (try_catch.HasCaught()) Error(try_catch);
+    if (try_catch.HasCaught()) Kernel::Error(try_catch);
   }
   
   freeaddrinfo(client->address);
@@ -347,28 +325,51 @@ void Client::Dispose(Persistent<Value> object, void *parameter) {
   if (!ev_is_active(&client->watcher)) delete client;
 }
 
-Handle<Value> Purge(const Arguments& args) {
+void Kernel::OnIdle(struct ev_loop *loop, ev_idle *w, int revents) {
+  if (eio_poll() != -1) ev_idle_stop(loop, w);
+}
+
+void Kernel::OnReady(struct ev_loop *loop, ev_async *w, int revents) {
+  if (eio_poll() == -1) ev_idle_start(loop, &idle_watcher);
+  else if (!eio_nreqs()) ev_async_stop(loop, &async_watcher);
+}
+
+void Kernel::Poll() {
+  ev_async_send(loop, &async_watcher);
+}
+
+string Kernel::Read(istream &input) {
+  string line, output = "";
+  while (getline(input, line))
+    output += line+'\n';
+  return output;
+}
+
+Handle<Value> Kernel::Print(const Arguments &args) {
+  if (args.Length()) fputs(*String::Utf8Value(args[0]), stdout);
+  return Undefined();
+}
+
+Handle<Value> Kernel::Purge(const Arguments &args) {
   while (!V8::IdleNotification());
   return Undefined();
 }
 
-Handle<Value> Print(const Arguments& args) {
-  fputs(*String::Utf8Value(args[0]), stdout);
-  return Undefined();
+void Kernel::RunAsync(void (*execute)(eio_req *), int pri, eio_cb cb, void *data) {
+  if (!ev_is_active(&async_watcher)) ev_async_start(loop, &async_watcher);
+  eio_custom(execute, pri, cb, data);
 }
 
-Handle<String> ReadScript(istream &input) {
-  string line, output = "";
-  while (getline(input, line))
-    output += line+'\n';
-  return String::New(output.c_str(), output.size());
+int Kernel::Error(const TryCatch &try_catch) {
+  Handle<Message> msg = try_catch.Message();
+  fprintf(stderr, "%s:%i: %s\n", *String::Utf8Value(msg->GetScriptResourceName()), msg->GetLineNumber(), *String::Utf8Value(msg->Get()));
+  return 1;
 }
 
-int main(int argc, char* argv[]) {
+int Kernel::Run(int argc, char *argv[]) {
   
-  HandleScope scope;
   const char *source;
-  Handle<String> code;
+  string code;
   
   if (argc > 1) {
     ifstream file(source = argv[1]);
@@ -376,33 +377,30 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
       return 1;
     }
-    code = ReadScript(file);
+    code = Read(file);
     file.close();
   } else {
     source = "stdin";
-    code = ReadScript(cin);
+    code = Read(cin);
   }
   
-  if (!code.IsEmpty()) {
-  
-    loop = EV_DEFAULT;
-    
-    /* Initialize eio */
-    ev_idle_init(&repeat_watcher, repeat);
-    ev_async_init(&ready_watcher, ready);
-    eio_init(want_poll, 0);
-    
-    Handle<ObjectTemplate> global = ObjectTemplate::New();
-    global->Set(String::New("setTimeout"), FunctionTemplate::New(Timer::New));
-    global->Set(String::New("listen"), FunctionTemplate::New(Server::New));
-    global->Set(String::New("connect"), FunctionTemplate::New(Client::New));
-    global->Set(String::New("print"), FunctionTemplate::New(Print));
+  return Run(code, source);
+}
 
+int Kernel::Run(string code, string source) {
+  
+  if (!code.empty()) {
+    
+    ev_idle_init(&idle_watcher, OnIdle);
+    ev_async_init(&async_watcher, OnReady);
+    eio_init(Poll, 0);
+    
+    HandleScope scope;
     Persistent<Context> context = Context::New(NULL, global);
     Context::Scope context_scope(context);
     
     TryCatch try_catch;
-    Handle<Script> script = Script::Compile(code, String::New(source));
+    Handle<Script> script = Script::Compile(String::New(code.c_str()), String::New(source.c_str()));
     
     if (script.IsEmpty() || script->Run().IsEmpty())
       return Error(try_catch);
@@ -413,3 +411,20 @@ int main(int argc, char* argv[]) {
   
   return 0;
 }
+
+#ifndef LIBKERNEL
+
+int main(int argc, char *argv[]) {
+  
+  HandleScope scope;
+  Kernel kernel;
+  
+  kernel->Set("setTimeout", FunctionTemplate::New(Timer::New));
+  kernel->Set("listen", FunctionTemplate::New(Server::New));
+  kernel->Set("connect", FunctionTemplate::New(Client::New));
+  kernel->Set("print", FunctionTemplate::New(Kernel::Print));
+
+  return kernel.Run(argc, argv);
+}
+
+#endif

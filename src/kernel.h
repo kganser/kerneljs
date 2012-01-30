@@ -97,6 +97,32 @@ class Client: public Agent {
     static Handle<Value> New(const Arguments &args);
 };
 
+class Kernel {
+  static ev_idle idle_watcher;
+  static ev_async async_watcher;
+  Handle<ObjectTemplate> global;
+  
+  static void OnIdle(struct ev_loop *loop, ev_idle *w, int revents);
+  static void OnReady(struct ev_loop *loop, ev_async *w, int revents);
+  static void Poll();
+  
+  static string Read(istream &input);
+  
+  public:
+    static struct ev_loop *loop;
+    
+    static Handle<Value> Print(const Arguments &args);
+    static Handle<Value> Purge(const Arguments &args);
+    static void RunAsync(void (*execute)(eio_req *), int pri, eio_cb cb, void *data);
+    static int Error(const TryCatch &try_catch);
+    
+    Kernel(): global(ObjectTemplate::New()) {}
+    ObjectTemplate *operator->() const { return *global; }
+    ObjectTemplate *operator *() const { return *global; }
+    int Run(int argc, char *argv[]);
+    int Run(string code, string source);
+};
+
 }
 
 #endif
