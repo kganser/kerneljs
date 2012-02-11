@@ -60,14 +60,14 @@ var kernel; if (!kernel) kernel = (function(modules, clients) {
       var client = {dependencies: {}, callback: callback};
       for (var module in modules) {
         if (modules.hasOwnProperty(module)) {
-          var dependency = client.dependencies[module] = [];
-          if (modules[module] instanceof Array) {
-            for (var i = 0; i < modules[module].length; i++) {
-              if (typeof modules[module][i] == "number") {
-                dependency[i] = [modules[module][i], [0]];
-              } else if (modules[module][i] instanceof Array) {
-                var major = modules[module][i][0];
-                var minor = modules[module][i][1];
+          var versions = modules[module], dependency = client.dependencies[module] = [];
+          if (versions instanceof Array) {
+            for (var i = 0; i < versions.length; i++) {
+              if (typeof versions[i] == "number") {
+                dependency[i] = [versions[i], [0]];
+              } else if (versions[i] instanceof Array) {
+                var major = versions[i][0];
+                var minor = versions[i][1];
                 dependency[i] = [typeof major == "number" ? major : 0, []];
                 if (minor instanceof Array) {
                   for (var j = minor.length-1; j >= 0; j--) {
@@ -89,7 +89,7 @@ var kernel; if (!kernel) kernel = (function(modules, clients) {
             }
           }
           if (!dependency.length) {
-            dependency.push([typeof modules[module] == "number" ? modules[module] : 0, [0]]);
+            dependency.push([typeof versions == "number" ? versions : 0, [0]]);
           } else {
             dependency.sort(function(a, b) { return b[0] - a[0]; });
           }
